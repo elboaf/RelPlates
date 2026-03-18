@@ -274,7 +274,12 @@ local function buildPlate(frame)
     p:SetFrameLevel(5)
     p:SetAllPoints(frame)
     p:RegisterForClicks("LeftButtonUp","RightButtonUp")
-    p:SetScript("OnClick", function() frame:Click(arg1) end)
+    p:SetScript("OnClick", function()
+        local guid = frame:GetName(1)
+        if guid and guid ~= "" then
+            TargetUnit(guid)
+        end
+    end)
 
     p.original = {}
 
@@ -652,12 +657,18 @@ local function updatePlate(frame)
         br.rt:ClearAllPoints(); br.rt:SetPoint("TOPRIGHT",    br.rv, "TOPLEFT",    0, 0); br.rt:Show()
         br.rb:ClearAllPoints(); br.rb:SetPoint("BOTTOMRIGHT", br.rv, "BOTTOMLEFT", 0, 0); br.rb:Show()
         p.hp.border:SetVertexColor(S.targetColor[1], S.targetColor[2], S.targetColor[3], 1)
-        p.hp:SetFrameLevel(20)
+        p:SetFrameLevel(20); p.hp:SetFrameLevel(21)
     else
         br.lv:Hide(); br.lt:Hide(); br.lb:Hide()
         br.rv:Hide(); br.rt:Hide(); br.rb:Hide()
         p.hp.border:SetVertexColor(0,0,0,1)
-        p.hp:SetFrameLevel(isAttacking and 12 or 8)
+        local lostAggro = (playerRole == "TANK") and inCombat and not isTopThreat
+        local highPriority = isAttacking or lostAggro
+        -- Lost aggro plates go above the target plate (22/23 > 20/21)
+        -- so they're always clickable even when overlapping the current target
+        local level = lostAggro and 22 or (highPriority and 16 or 5)
+        p:SetFrameLevel(level)
+        p.hp:SetFrameLevel(level + 1)
     end
 
     -- Cast bar
@@ -759,14 +770,22 @@ mainFrame:SetScript("OnUpdate", function()
     for frame, plate in pairs(registry) do
         if frame:IsShown() then
             if not plate:IsShown() then
-                plate:Show(); plate:ClearAllPoints(); plate:SetAllPoints(frame)
+                plate:Show()
             end
             updatePlate(frame)
             if overlap then
                 frame:EnableMouse(false)
                 if frame:GetWidth() > 1 then frame:SetWidth(1); frame:SetHeight(1) end
+                -- Re-anchor plate to frame position but give it explicit size
+                -- so it stays clickable even though the vanilla frame is 1x1
+                plate:ClearAllPoints()
+                plate:SetPoint("CENTER", frame, "CENTER", 0, 0)
+                plate:SetWidth(S.hpWidth + 10)
+                plate:SetHeight(S.hpHeight + 30)
                 plate:EnableMouse(true)
             else
+                plate:ClearAllPoints()
+                plate:SetAllPoints(frame)
                 frame:EnableMouse(true); plate:EnableMouse(false)
             end
         else
