@@ -2,7 +2,7 @@
 ## Title: RelPlates
 ## Notes: Nameplate addon for WoW 1.12.1 (Turtle WoW) — SuperWoW required
 ## Author: Vati
-## Version: 1.1.0
+## Version: 1.1.1
 ## SavedVariables: RelPlatesDB
 
 RelPlates_Settings.lua
