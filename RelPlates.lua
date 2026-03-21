@@ -22,7 +22,7 @@ local S           = {}   -- Settings
 local tankList    = {}   -- lowercased player names of designated off-tanks
 local playerRole  = "DPS"
 local minimapAngle = 220
-local overlap     = true
+local overlap      = true   -- true = plates overlap freely, false = engine stacks them
 
 -- ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -55,19 +55,24 @@ local DEFAULTS = {
     colorRed      = {0.85, 0.20, 0.20, 1},
     colorOrange   = {1.00, 0.55, 0.00, 1},
     colorBlue     = {0.41, 0.35, 0.76, 1},
+    colorOtherTank= {0.95, 0.50, 0.50, 1},
+    colorTapped   = {0.50, 0.50, 0.50, 1},
+    colorFriendly = {0.27, 0.63, 0.27, 1},
+    colorNeutral  = {0.90, 0.70, 0.00, 1},
+    colorMana     = {0.07, 0.58, 1.00, 1},
 }
 
-for k, v in pairs(DEFAULTS) do S[k] = v end
+for k, v in pairs(DEFAULTS) do
+    if type(v) == "table" then
+        local t = {}
+        for i, v2 in pairs(v) do t[i] = v2 end
+        S[k] = t
+    else
+        S[k] = v
+    end
+end
 
 -- ── Threat colors ─────────────────────────────────────────────────────────────
-
-local C = {
-    OTHER_TANK = {0.95, 0.50, 0.50, 1},
-    TAPPED     = {0.50, 0.50, 0.50, 1},
-    FRIENDLY   = {0.27, 0.63, 0.27, 1},
-    NEUTRAL    = {0.90, 0.70, 0.00, 1},
-    MANA       = {0.07, 0.58, 1.00, 1},
-}
 
 local CLASS_COLORS = {
     WARRIOR={0.78,0.61,0.43,1}, PALADIN={0.96,0.55,0.73,1},
@@ -103,6 +108,86 @@ local function guidToKey(guid)
 end
 
 -- ── Threat engine ─────────────────────────────────────────────────────────────
+--
+-- RelPlates has a fully standalone threat engine. TWThreat does NOT need to be
+-- installed. We speak the same wire protocol and maintain our own threat tables.
+--
+-- HOW IT WORKS
+-- ─────────────
+-- Every 0.2s while in combat with a group and targeting an elite or worldboss,
+-- we send:  SendAddonMessage("TWT_UDTSv4_TM", "limit=10", "RAID"/"PARTY")
+--
+-- The server responds with two possible packet types (via CHAT_MSG_ADDON):
+--
+--   TWTv4=name:tank:threat:perc:melee;...
+--     Single-target data for the current target. One entry per player.
+--     tank=1 means that player is top threat holder.
+--     perc = that player's % of the top threat holder (0-100).
+--     We extract our own perc and isTank status, plus the highest non-tank perc.
+--
+--   TMTv1=creature:guid:name:perc;...
+--     Multi-mob tank-mode data. One entry per mob the server has threat data for.
+--     guid = last 4 hex digits of SuperWoW GUID converted to decimal string.
+--     name = second-highest threat holder on that creature.
+--     perc = second-highest holder's % of top on that creature (0-100).
+--     Only sent when the requesting player has top threat on at least one mob.
+--     This is the key AoE limitation — DPS never receive TMTv1= data.
+--
+-- The server often sends a combined packet: TWTv4=...#TMTv1=...
+--
+-- GUID KEY CONVERSION
+-- ───────────────────
+-- SuperWoW GUIDs look like "0xF130002C3600BE12".
+-- TMTv1= uses the last 4 hex digits converted to decimal as the mob identifier.
+-- e.g. "0xF130002C3600BE12" → last4 = "BE12" → 48658
+-- This is how we correlate nameplate GUIDs to threat table entries.
+--
+-- DATA TABLES
+-- ───────────
+-- GP_st[key] = single-target data (from TWTv4=), keyed by GUID key
+--   { perc, isTank, warningPerc, time }
+--   warningPerc: if isTank → highest non-tank's %; if DPS → our own %
+--   TTL: 3s, but extended while the mob's plate is still visible (stun support)
+--
+-- GP_tm[key] = tank-mode data (from TMTv1=), keyed by GUID key
+--   { creature, name, perc, time }
+--   perc = second-highest threat holder's % of top on that mob
+--   TTL: same as GP_st — extended while plate is visible
+--   Priority: GP_tm is checked first, falls through to GP_st if absent/expired
+--
+-- Both tables are wiped on PLAYER_REGEN_ENABLED (combat end).
+--
+-- COLOR SYSTEM
+-- ─────────────
+-- Role-aware, split into two independent gradients:
+--
+--   TANK mode (playerRole == "TANK"):
+--     Has aggro    → red → orange  (gradient starts at 50% challenger threat)
+--     Lost aggro   → static blue
+--     Lost-aggro plates pop to frame level 22 (above target at 20) so they
+--     are always clickable for fast retaunt targeting.
+--
+--   DPS/Healer mode:
+--     No aggro     → blue → red    (gradient starts at 50% of tank's threat)
+--     Has aggro    → static red
+--
+--   Both roles:
+--     Friendly     → green
+--     Neutral idle → yellow
+--     Enemy player → class color
+--     Tapped       → grey
+--     Off-tank mob → light red (mob targeting a player in tankList)
+--
+-- STUN / CC COLOR CACHING
+-- ────────────────────────
+-- When a mob has no target and isn't attacking (stunned, feared, CC'd),
+-- inCombat and isAttacking both drop to false. Without caching this would
+-- cause the plate to snap to the binary fallback color (blue/neutral).
+-- Instead, we cache the last computed threat color on the plate frame and
+-- serve it whenever the mob appears stunned, refreshing the cache timestamp
+-- each frame so long stuns don't expire it. The cache is cleared when the
+-- plate is hidden (mob dies/despawns).
+--
 
 local PLAYER_NAME = UnitName("player")
 local GP_st = {}   -- single-target data keyed by GUID key
@@ -156,8 +241,6 @@ local function parseThreatPacket(msg)
         warningPerc = myTank and topOther or myPerc,
         time        = GetTime(),
     }
-    GP_log(string.format("ST_DATA key=%s perc=%.1f isTank=%s warn=%.1f topOther=%.1f",
-        key, myPerc, tostring(myTank), myTank and topOther or myPerc, topOther))
 end
 
 local function parseTankModePacket(msg)
@@ -169,8 +252,6 @@ local function parseTankModePacket(msg)
         local f = explode(entry, ":")
         if f[1] and f[2] and f[3] and f[4] then
             GP_tm[f[2]] = { creature=f[1], name=f[3], perc=tonumber(f[4]) or 0, time=GetTime() }
-            GP_log(string.format("TM_DATA key=%s creature=%s name=%s perc=%.1f",
-                f[2], f[1], f[3], tonumber(f[4]) or 0))
         end
     end
 end
@@ -186,6 +267,10 @@ local function onPacket(msg)
     end
 end
 
+local registry = {}
+local castDB   = {}
+local plateSeq = 0
+
 local pollFrame = CreateFrame("Frame")
 pollFrame:Hide()
 pollFrame:SetScript("OnShow",   function() this.t = GetTime() end)
@@ -196,32 +281,32 @@ pollFrame:SetScript("OnUpdate", function()
     this.t = now
     local ch = GetNumRaidMembers() > 0 and "RAID" or "PARTY"
     if GetNumRaidMembers() == 0 and GetNumPartyMembers() == 0 then return end
-    if not UnitExists("target") or UnitIsPlayer("target") then return end
-    if UnitIsDead("target") or not UnitAffectingCombat("target") then return end
-    local cl = UnitClassification("target")
-    if cl ~= "elite" and cl ~= "worldboss" then return end
     SendAddonMessage("TWT_UDTSv4_TM", "limit=10", ch)
+
+    -- Build set of keys that have a visible plate right now
+    local activeKeys = {}
+    for frame, plate in pairs(registry) do
+        if frame:IsShown() then
+            local g = frame:GetName(1)
+            local k = g and guidToKey(g)
+            if k then activeKeys[k] = true end
+        end
+    end
+
+    -- ST entries expire normally at GP_TTL — don't extend them while visible.
+    -- Stale isTank=true data after an aggro swap is worse than no data.
+    -- TM entries are extended while visible for stun/CC support (the server
+    -- stops sending TM data when you lose top threat, so we keep it alive).
     for k, v in pairs(GP_st) do
         if now - v.time > GP_TTL then GP_st[k] = nil end
     end
     for k, v in pairs(GP_tm) do
-        if now - v.time > GP_TTL then GP_tm[k] = nil end
+        if now - v.time > GP_TTL and not activeKeys[k] then GP_tm[k] = nil end
     end
 end)
 
 local function combatEnd()
     wipe(GP_st); wipe(GP_tm); pollFrame:Hide()
-end
-
-local function getThreat(guid)
-    if not guid or guid == "" then return 0, false, false end
-    local key = guidToKey(guid)
-    if not key then return 0, false, false end
-    local tm = GP_tm[key]
-    if tm then return tm.perc, true, nil end  -- isTopThreat = nil = use fallback
-    local st = GP_st[key]
-    if st then return st.warningPerc, true, st.isTank end
-    return 0, false, false
 end
 
 -- ── Color helpers ─────────────────────────────────────────────────────────────
@@ -248,10 +333,6 @@ end
 
 -- ── Nameplate registry & building ────────────────────────────────────────────
 
-local registry = {}
-local castDB   = {}
-local plateSeq = 0
-
 local function isNameplateFrame(f)
     if not f then return false end
     local t = f:GetObjectType()
@@ -272,7 +353,6 @@ local function buildPlate(frame)
     p:EnableMouse(false)
     p:SetFrameStrata("BACKGROUND")
     p:SetFrameLevel(5)
-    p:SetAllPoints(frame)
     p:RegisterForClicks("LeftButtonUp","RightButtonUp")
     p:SetScript("OnClick", function()
         local guid = frame:GetName(1)
@@ -312,7 +392,7 @@ local function buildPlate(frame)
     p.mp = CreateFrame("StatusBar", nil, p)
     p.mp:SetFrameStrata("BACKGROUND"); p.mp:SetFrameLevel(6)
     p.mp:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
-    p.mp:SetStatusBarColor(C.MANA[1], C.MANA[2], C.MANA[3], 1)
+    p.mp:SetStatusBarColor(S.colorMana[1], S.colorMana[2], S.colorMana[3], 1)
     p.mp:SetPoint("TOP", p.hp, "BOTTOM", 0, 0); p.mp:Hide()
     p.mp.bg = p.mp:CreateTexture(nil, "BACKGROUND")
     p.mp.bg:SetTexture(0,0,0,0.8); p.mp.bg:SetAllPoints()
@@ -495,19 +575,29 @@ local function updatePlate(frame)
     local isHostile  = r > 0.8 and g < 0.5
     local isNeutral  = not isFriendly and not isHostile
 
-    -- Suppress original visuals
-    orig.hp:SetStatusBarTexture(""); orig.hp:SetAlpha(0)
-    for _, r in ipairs({frame:GetRegions()}) do
-        if r and r.GetObjectType then
-            local ot = r:GetObjectType()
-            if ot == "Texture" and r ~= orig.raidicon then r:SetAlpha(0)
-            elseif ot == "FontString" then r:SetAlpha(0) end
+    -- Suppress original textures once (stable, don't change after first pass).
+    -- FontStrings must be suppressed every frame — the game resets their alpha
+    -- on unit updates, causing original name/level text to bleed through.
+    if not p.suppressed then
+        orig.hp:SetStatusBarTexture(""); orig.hp:SetAlpha(0)
+        for _, reg in ipairs({frame:GetRegions()}) do
+            if reg and reg.GetObjectType then
+                local ot = reg:GetObjectType()
+                if ot == "Texture" and reg ~= orig.raidicon then reg:SetAlpha(0) end
+            end
         end
+        for _, ch in ipairs({frame:GetChildren()}) do
+            if ch and ch ~= p and ch ~= orig.hp then
+                if ch.SetAlpha then ch:SetAlpha(0) end
+                if ch.Hide then ch:Hide() end
+            end
+        end
+        p.suppressed = true
     end
-    for _, ch in ipairs({frame:GetChildren()}) do
-        if ch and ch ~= p and ch ~= orig.hp then
-            if ch.SetAlpha then ch:SetAlpha(0) end
-            if ch.Hide then ch:Hide() end
+    -- Always hide original FontStrings (name, level) every frame
+    for _, reg in ipairs({frame:GetRegions()}) do
+        if reg and reg.GetObjectType and reg:GetObjectType() == "FontString" then
+            reg:SetAlpha(0)
         end
     end
 
@@ -566,71 +656,100 @@ local function updatePlate(frame)
         else p.mp:Hide() end
     else p.mp:Hide() end
 
-    -- Threat
-    local threatPct, hasThreat, isTopThreat = 0, false, isAttacking
-    if guid and isHostile then
-        local tp, ht, it = getThreat(guid)
-        threatPct = tp; hasThreat = ht
-        if ht then
-            if it ~= nil then isTopThreat = it
-            else isTopThreat = isAttacking end
+    -- Track whether this mob has been in combat this plate lifetime.
+    -- Set when we observe a target or being attacked. Cleared on plate hide.
+    if inCombat or isAttacking then
+        p.wasInCombat = true
+    end
+
+    local now = GetTime()
+
+    -- ── Threat data hierarchy ──────────────────────────────────────────────────
+    -- ST data (TWTv4=)  : ultimate truth. isTank is authoritative. Expires at 3s.
+    -- TM data (TMTv1=)  : truthful when present, but lossy — server only sends it
+    --                     when we have top threat, and drops mobs silently on swap.
+    --                     TTL extended while plate is visible for stun support.
+    -- isAttacking       : decent indicator we have aggro, but not always true
+    --                     (mob may be casting on a secondary target).
+    -- inCombat          : mob has a target, but not necessarily us.
+    -- not inCombat      : mob has no target — does NOT mean out of combat.
+    -- ─────────────────────────────────────────────────────────────────────────
+
+    local threatPct   = 0
+    local hasThreat   = false
+    local isTopThreat = false
+
+    if p.wasInCombat and guid and guid ~= "" then
+        local key = guidToKey(guid)
+        if key then
+            local st = GP_st[key]
+            local tm = GP_tm[key]
+            if st then
+                -- ST is ultimate truth
+                threatPct   = st.warningPerc
+                hasThreat   = true
+                isTopThreat = st.isTank
+            elseif tm then
+                -- TM is truthful when present: we have top threat
+                threatPct   = tm.perc
+                hasThreat   = true
+                isTopThreat = true
+            end
         end
     end
 
     -- Color decision
     local col
-    local colorBranch = "unknown"
     if isFriendly then
-        col = C.FRIENDLY; colorBranch = "friendly"
-    elseif isNeutral and not inCombat and not hasThreat then
-        col = C.NEUTRAL; colorBranch = "neutral-idle"
+        col = S.colorFriendly
+
     elseif isEnemyPlayer and unitClass and CLASS_COLORS[unitClass] then
-        col = CLASS_COLORS[unitClass]; colorBranch = "class-color"
+        col = CLASS_COLORS[unitClass]
+
     elseif isTapped then
-        col = C.TAPPED; colorBranch = "tapped"
+        col = S.colorTapped
+
+    elseif isTargetTank then
+        -- Mob is targeting a listed off-tank — highest priority combat signal,
+        -- overrides threat data (which may be stale or from a different target state)
+        col = S.colorOtherTank
+
     elseif hasThreat then
-        if isTargetTank then
-            col = C.OTHER_TANK; colorBranch = "data-other-tank"
-        elseif isTopThreat then
+        -- Packet data available — trust it, regardless of mob target state
+        if isTopThreat then
             col = threatColor(true, threatPct)
-            colorBranch = "data-top-threat pct="..string.format("%.1f",threatPct)
         else
             col = threatColor(false, threatPct)
-            colorBranch = "data-not-top pct="..string.format("%.1f",threatPct)
         end
-    else
-        -- No threat data: binary fallback
-        if isTargetTank then
-            col = C.OTHER_TANK; colorBranch = "fallback-other-tank"
-        elseif isAttacking then
-            col = S.colorRed; colorBranch = "fallback-attacking"
-        elseif not inCombat then
-            col = isNeutral and C.NEUTRAL or S.colorBlue
-            colorBranch = "fallback-no-combat"
-        else
-            col = S.colorBlue; colorBranch = "fallback-no-aggro"
-        end
-    end
-    setColor(p.hp, col)
 
-    -- Debug: log this plate's state once per second if hostile
-    if dbEnabled and guid and guid ~= "" and isHostile then
-        local now = GetTime()
-        local key = guidToKey(guid) or "nil"
-        -- throttle per-guid: log each plate at most once per second
-        if not p.dbLastLog or now - p.dbLastLog >= 1.0 then
-            p.dbLastLog = now
-            local tm = GP_tm[key]; local st = GP_st[key]
-            local src = tm and "TM" or (st and "ST" or "none")
-            local pname = orig.name and orig.name.GetText and (orig.name:GetText() or "?") or "?"
-            GP_log(string.format(
-                "PLATE [%s] key=%s src=%s atk=%s top=%s inCombat=%s tgtTank=%s hasThreat=%s pct=%.1f | %s",
-                pname, key, src,
-                tostring(isAttacking), tostring(isTopThreat),
-                tostring(inCombat), tostring(isTargetTank),
-                tostring(hasThreat), threatPct, colorBranch))
+    elseif isAttacking then
+        -- No packet data, but mob is on us — decent indicator
+        col = S.colorRed
+
+    elseif inCombat then
+        -- Mob has a target, not us, no packet data
+        col = S.colorBlue
+
+    elseif p.wasInCombat then
+        -- Mob has no target but was in combat — stunned/CC'd/brief gap.
+        -- not inCombat does NOT mean out of combat.
+        if p.colorCache and (now - p.colorCache.time < GP_TTL) then
+            col = p.colorCache.col
+        else
+            col = S.colorBlue
         end
+
+    else
+        -- Genuinely idle
+        col = isNeutral and S.colorNeutral or S.colorBlue
     end
+
+    -- Cache while mob has an active target so stun fallback stays fresh
+    if inCombat or isAttacking then
+        p.colorCache = { col = col, time = now }
+    end
+
+    setColor(p.hp, col)
 
     -- Target indicator (GUID-based, exact)
     local isTarget = false
@@ -673,7 +792,6 @@ local function updatePlate(frame)
 
     -- Cast bar
     local cast = nil
-    local now  = GetTime()
     if guid and UnitCastingInfo then
         local spell,_,_,texture,startMs,endMs = UnitCastingInfo(guid)
         if spell then cast = {spell=spell,icon=texture,start=startMs/1000,dur=endMs-startMs} end
@@ -718,41 +836,6 @@ local function updatePlate(frame)
     end
 end
 
--- ── Debug logging ─────────────────────────────────────────────────────────────
-
-local dbLog        = {}
-local dbEnabled    = false
-local dbCount      = 0
-local dbCombatN    = 0
-
-function GP_log(line)
-    if not dbEnabled then return end
-    dbCount = dbCount + 1
-    table.insert(dbLog, string.format("[%.2f] %s", GetTime(), line))
-end
-
-local function dbFlush(reason)
-    if not dbEnabled or dbCount == 0 then return end
-    local fname = "RelPlates_debug_" .. (UnitName("player") or "unknown") .. ".txt"
-    ExportFile(fname, table.concat(dbLog, "\n"))
-    Print("Debug log saved: imports/"..fname.." ("..dbCount.." entries, "..reason..")")
-    dbLog = {}; dbCount = 0
-end
-
-local function dbCombatStart()
-    if not dbEnabled then return end
-    dbCombatN = dbCombatN + 1
-    table.insert(dbLog, string.format("\n=== COMBAT #%d START [%.2f] role=%s ===", dbCombatN, GetTime(), playerRole))
-    dbCount = dbCount + 1
-end
-
-local function dbCombatEnd()
-    if not dbEnabled then return end
-    table.insert(dbLog, string.format("=== COMBAT #%d END [%.2f] ===", dbCombatN, GetTime()))
-    dbCount = dbCount + 1
-    dbFlush("combat #"..dbCombatN.." ended")
-end
-
 -- ── Main frame / events ───────────────────────────────────────────────────────
 
 local mainFrame = CreateFrame("Frame", "RelPlatesFrame", UIParent)
@@ -761,7 +844,6 @@ mainFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 mainFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 mainFrame:RegisterEvent("UNIT_CASTEVENT")
 mainFrame:RegisterEvent("CHAT_MSG_ADDON")
-mainFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 
 mainFrame:SetScript("OnUpdate", function()
     for _, f in ipairs({WorldFrame:GetChildren()}) do
@@ -774,22 +856,50 @@ mainFrame:SetScript("OnUpdate", function()
             end
             updatePlate(frame)
             if overlap then
+                -- Overlap mode: shrink vanilla frame to 1x1 so the engine ignores
+                -- it for stacking. Plates sit freely at the unit's natural screen position.
+                if frame:GetWidth() > 1 then
+                    frame:SetWidth(1); frame:SetHeight(1)
+                end
                 frame:EnableMouse(false)
-                if frame:GetWidth() > 1 then frame:SetWidth(1); frame:SetHeight(1) end
-                -- Re-anchor plate to frame position but give it explicit size
-                -- so it stays clickable even though the vanilla frame is 1x1
-                plate:ClearAllPoints()
-                plate:SetPoint("CENTER", frame, "CENTER", 0, 0)
-                plate:SetWidth(S.hpWidth + 10)
-                plate:SetHeight(S.hpHeight + 30)
-                plate:EnableMouse(true)
+                if not plate.layoutSetup or plate.layoutW ~= S.hpWidth or plate.layoutH ~= S.hpHeight then
+                    plate:ClearAllPoints()
+                    plate:SetPoint("CENTER", frame, "CENTER", 0, 0)
+                    plate:SetWidth(S.hpWidth + 10)
+                    plate:SetHeight(S.hpHeight + 30)
+                    plate:EnableMouse(true)
+                    plate.layoutSetup = true
+                    plate.layoutW = S.hpWidth
+                    plate.layoutH = S.hpHeight
+                    applyDimensions(plate)
+                end
             else
-                plate:ClearAllPoints()
-                plate:SetAllPoints(frame)
-                frame:EnableMouse(true); plate:EnableMouse(false)
+                -- Stacking mode: match vanilla frame size to our overlay so the engine
+                -- spaces plates correctly based on our actual bar dimensions.
+                local targetW = math.floor((S.hpWidth + 10) * UIParent:GetScale())
+                local targetH = math.floor((S.hpHeight + 30) * UIParent:GetScale())
+                if math.floor(frame:GetWidth()) ~= targetW then
+                    frame:SetWidth(targetW); frame:SetHeight(targetH)
+                end
+                frame:EnableMouse(false)
+                if not plate.layoutSetup or plate.layoutW ~= S.hpWidth or plate.layoutH ~= S.hpHeight then
+                    plate:ClearAllPoints()
+                    plate:SetPoint("CENTER", frame, "CENTER", 0, 0)
+                    plate:SetWidth(S.hpWidth + 10)
+                    plate:SetHeight(S.hpHeight + 30)
+                    plate:EnableMouse(true)
+                    plate.layoutSetup = true
+                    plate.layoutW = S.hpWidth
+                    plate.layoutH = S.hpHeight
+                    applyDimensions(plate)
+                end
             end
         else
             if plate:IsShown() then plate:Hide() end
+            plate.colorCache  = nil
+            plate.suppressed  = nil
+            plate.layoutSetup = nil
+            plate.wasInCombat = nil
         end
     end
 end)
@@ -797,34 +907,13 @@ end)
 mainFrame:SetScript("OnEvent", function()
     if event == "PLAYER_REGEN_DISABLED" then
         pollFrame:Show()
-        dbCombatStart()
     elseif event == "PLAYER_REGEN_ENABLED" then
-        dbCombatEnd()
         combatEnd()
     elseif event == "PLAYER_ENTERING_WORLD" then
         combatEnd(); wipe(castDB)
         Print("Loaded. /rp for options.")
     elseif event == "PLAYER_TARGET_CHANGED" then
-        if dbEnabled then
-            -- throttle: skip rapid-fire untargeting spam
-            local now = GetTime()
-            if not mainFrame.dbLastTargetLog or now - mainFrame.dbLastTargetLog >= 0.3 then
-                mainFrame.dbLastTargetLog = now
-                if UnitExists("target") and not UnitIsPlayer("target") and not UnitIsFriend("player","target") then
-                    local tname = UnitName("target") or "?"
-                    local _, tguid = UnitExists("target")
-                    local key = tguid and guidToKey(tguid) or "nil"
-                    local tm = GP_tm[key]; local st = GP_st[key]
-                    local tmStr = tm and string.format("TM:perc=%.1f", tm.perc) or "TM:none"
-                    local stStr = st and string.format("ST:perc=%.1f isTank=%s warn=%.1f", st.perc, tostring(st.isTank), st.warningPerc) or "ST:none"
-                    local cl = UnitClassification("target") or "?"
-                    GP_log(string.format("TARGET [%s] guid=%s key=%s class=%s %s %s",
-                        tname, tostring(tguid), key, cl, tmStr, stStr))
-                else
-                    GP_log("TARGET -> none/friendly/player")
-                end
-            end
-        end
+        -- nothing needed at runtime
 
     elseif event == "UNIT_CASTEVENT" then
         local cg, etype, sid, dur = arg1, arg3, arg4, arg5
@@ -833,42 +922,27 @@ mainFrame:SetScript("OnEvent", function()
             local spell, _, icon
             if SpellInfo and sid then spell,_,icon = SpellInfo(sid) end
             castDB[cg] = { spell=spell or "Casting", icon=icon, start=GetTime(), dur=dur or 0 }
-            if dbEnabled and registry then
-                -- only log if this caster has a nameplate
-                for frame in pairs(registry) do
-                    local fg = frame:GetName(1)
-                    if fg == cg then
-                        local key = guidToKey(cg) or "nil"
-                        local tm = GP_tm[key]; local st = GP_st[key]
-                        GP_log(string.format("CAST [%s] %s key=%s dur=%dms TM:%s ST:%s",
-                            etype, spell or "?", key, dur or 0,
-                            tm and string.format("perc=%.1f",tm.perc) or "none",
-                            st and string.format("perc=%.1f warn=%.1f",st.perc,st.warningPerc) or "none"))
-                        break
-                    end
-                end
-            end
         elseif etype == "CAST" or etype == "FAIL" then
             castDB[cg] = nil
-            if dbEnabled then
-                local key = guidToKey(cg) or "nil"
-                if GP_tm[key] or GP_st[key] then
-                    GP_log(string.format("CAST [%s] guid=%s key=%s", etype, cg, key))
-                end
-            end
         end
     elseif event == "CHAT_MSG_ADDON" then
-        if arg2 then
-            local isTWT = string.find(arg2,"TWTv4=",1,true) or string.find(arg2,"TMTv1=",1,true)
-            if isTWT then GP_log("PKT ["..(arg1 or "?").."] "..arg2) end
-            onPacket(arg2)
-        end
+        if arg2 then onPacket(arg2) end
     end
 end)
 
 -- ── Settings save/load ────────────────────────────────────────────────────────
 
+local function invalidatePlateLayout()
+    for _, plate in pairs(registry) do
+        plate.layoutSetup = nil
+        plate.suppressed  = nil
+        plate.wasInCombat = nil
+        plate.colorCache  = nil
+    end
+end
+
 local function SaveSettings()
+    invalidatePlateLayout()
     RelPlatesDB = RelPlatesDB or {}
     RelPlatesDB.playerRole   = playerRole
     RelPlatesDB.overlap      = overlap
@@ -892,12 +966,19 @@ local function LoadSettings()
             end
         end
     end
-    -- Legacy compat
-    if RelPlatesDB.nameplateOverlap ~= nil then overlap = RelPlatesDB.nameplateOverlap end
 end
 
 local function resetSettings()
-    for k, v in pairs(DEFAULTS) do S[k] = v end
+    for k, v in pairs(DEFAULTS) do
+        if type(v) == "table" then
+            -- deep copy so DEFAULTS tables aren't shared with S
+            local t = {}
+            for i2, v2 in pairs(v) do t[i2] = v2 end
+            S[k] = t
+        else
+            S[k] = v
+        end
+    end
     SaveSettings()
     Print("Settings reset to defaults.")
 end
@@ -913,13 +994,17 @@ mmBtn:SetWidth(32); mmBtn:SetHeight(32); mmBtn:SetFrameStrata("LOW")
 mmBtn:SetPoint("TOPLEFT", Minimap, "TOPLEFT",
     math.cos(math.rad(minimapAngle))*80-16,
     math.sin(math.rad(minimapAngle))*80+16)
+
 local mmIcon = mmBtn:CreateTexture(nil, "BACKGROUND")
 mmIcon:SetTexture("Interface\\Icons\\INV_Misc_Head_Dragon_01")
-mmIcon:SetAllPoints(); mmIcon:SetTexCoord(0.08,0.92,0.08,0.92)
+mmIcon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+mmIcon:SetWidth(20); mmIcon:SetHeight(20)
+mmIcon:SetPoint("CENTER", mmBtn, "CENTER", 0, 0)
+
 local mmBorder = mmBtn:CreateTexture(nil, "OVERLAY")
 mmBorder:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
-mmBorder:SetWidth(56); mmBorder:SetHeight(56)
-mmBorder:SetPoint("TOPLEFT", mmBtn, "TOPLEFT", -12, 12)
+mmBorder:SetWidth(52); mmBorder:SetHeight(52)
+mmBorder:SetPoint("CENTER", mmBtn, "CENTER", 10, -10)
 mmBtn:SetMovable(true)
 mmBtn:RegisterForClicks("LeftButtonUp","RightButtonUp")
 mmBtn:RegisterForDrag("LeftButton")
@@ -967,34 +1052,6 @@ SlashCmdList["RELPLATES"] = function(raw)
         if RelPlatesTankListFrame:IsShown() then RelPlatesTankListFrame:Hide()
         else RelPlatesTankListFrame:Show(); RelPlates_RefreshTankList() end
 
-    elseif msg == "debugpacket" then
-        if dbEnabled then
-            dbEnabled = false
-            dbFlush("manual save")
-            if dbCount == 0 then Print("Nothing captured") end
-            dbLog = {}; dbCount = 0; dbCombatN = 0
-        else
-            dbLog = {}; dbCount = 0; dbCombatN = 0
-            dbEnabled = true
-            Print("Debug logging on. Flushes to imports/RelPlates_debug.txt after each combat.")
-            Print("/rp debugpacket again to stop and save immediately.")
-        end
-
-    elseif msg == "debugthreat" then
-        local tmN,stN = 0,0
-        for _ in pairs(GP_tm) do tmN=tmN+1 end
-        for _ in pairs(GP_st) do stN=stN+1 end
-        Print("TMTv1= entries: "..tmN.."  TWTv4= entries: "..stN)
-        if UnitExists("target") then
-            local _, tguid = UnitExists("target")
-            local key = tguid and guidToKey(tguid) or "nil"
-            Print("GUID: "..tostring(tguid).."  key: "..key)
-            local tm = GP_tm[key]; local st = GP_st[key]
-            if tm then Print("TMTv1: "..tm.creature.." perc="..tm.perc) end
-            if st then Print("TWTv4: perc="..st.perc.." isTank="..tostring(st.isTank).." warn="..st.warningPerc) end
-            if not tm and not st then Print("No data") end
-        else Print("No target") end
-
     elseif msg == "ot" or msg == "othertank"
         or string.find(msg,"^ot ") or string.find(msg,"^othertank ") then
         local cmd = string.gsub(string.gsub(msg,"^othertank%s*",""),"^ot%s*","")
@@ -1020,7 +1077,7 @@ SlashCmdList["RELPLATES"] = function(raw)
         end
 
     else
-        Print("/rp tank|dps|toggle|config|tanks|ot|debugpacket|debugthreat  (role: "..playerRole..")")
+        Print("/rp tank|dps|toggle|config|tanks|ot  (role: "..playerRole..")")
     end
 end
 
@@ -1117,7 +1174,7 @@ end
 -- General tab
 local g = tabPanels[1]
 mkCB(g,5,-5,"Show Mana Bar",function() return S.mpShow end,function(v) S.mpShow=v end)
-mkCB(g,5,-30,"Overlap Mode",function() return overlap end,function(v) overlap=v end)
+mkCB(g,5,-30,"Overlap Mode",function() return overlap end,function(v) overlap=v; invalidatePlateLayout() end)
 local roleL=g:CreateFontString(nil,"OVERLAY","GameFontNormal")
 roleL:SetPoint("TOPLEFT",g,"TOPLEFT",5,-62); roleL:SetText("Role:")
 local tbtn=CreateFrame("Button",nil,g,"UIPanelButtonTemplate")
@@ -1153,9 +1210,11 @@ local colDefs = {
     {"Tank: Aggro",    S, "colorRed"},
     {"Tank: Warning",  S, "colorOrange"},
     {"DPS: Safe",      S, "colorBlue"},
-    {"Other Tank",     C, "OTHER_TANK"},
-    {"Tapped",         C, "TAPPED"},
-    {"Mana Bar",       C, "MANA"},
+    {"Other Tank",     S, "colorOtherTank"},
+    {"Tapped",         S, "colorTapped"},
+    {"Friendly",       S, "colorFriendly"},
+    {"Neutral",        S, "colorNeutral"},
+    {"Mana Bar",       S, "colorMana"},
     {"Target Border",  S, "targetColor"},
 }
 
