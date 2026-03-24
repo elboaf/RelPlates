@@ -178,15 +178,15 @@ end
 --     Tapped       → grey
 --     Off-tank mob → light red (mob targeting a player in tankList)
 --
--- STUN / CC COLOR CACHING
--- ────────────────────────
--- When a mob has no target and isn't attacking (stunned, feared, CC'd),
--- inCombat and isAttacking both drop to false. Without caching this would
--- cause the plate to snap to the binary fallback color (blue/neutral).
--- Instead, we cache the last computed threat color on the plate frame and
--- serve it whenever the mob appears stunned, refreshing the cache timestamp
--- each frame so long stuns don't expire it. The cache is cleared when the
--- plate is hidden (mob dies/despawns).
+-- STUN / CC HANDLING
+-- ───────────────────
+-- When a mob has no target (stunned, feared, CC'd), inCombat and isAttacking
+-- both drop to false. We track wasInCombat on each plate so the stun state
+-- is distinguishable from a genuinely idle mob.
+-- TM data TTL is extended while the plate is visible, so if we have top threat
+-- the gradient color continues to show correctly through the stun.
+-- If no TM/ST data exists during a stun, blue is shown — which is correct,
+-- since no data means we don't have confirmed top threat.
 --
 
 local PLAYER_NAME = UnitName("player")
@@ -732,21 +732,13 @@ local function updatePlate(frame)
 
     elseif p.wasInCombat then
         -- Mob has no target but was in combat — stunned/CC'd/brief gap.
-        -- not inCombat does NOT mean out of combat.
-        if p.colorCache and (now - p.colorCache.time < GP_TTL) then
-            col = p.colorCache.col
-        else
-            col = S.colorBlue
-        end
+        -- TM data (extended TTL) covers this if we have top threat.
+        -- If we have no data here, blue is correct — we don't have aggro.
+        col = S.colorBlue
 
     else
         -- Genuinely idle
         col = isNeutral and S.colorNeutral or S.colorBlue
-    end
-
-    -- Cache while mob has an active target so stun fallback stays fresh
-    if inCombat or isAttacking then
-        p.colorCache = { col = col, time = now }
     end
 
     setColor(p.hp, col)
@@ -896,7 +888,6 @@ mainFrame:SetScript("OnUpdate", function()
             end
         else
             if plate:IsShown() then plate:Hide() end
-            plate.colorCache  = nil
             plate.suppressed  = nil
             plate.layoutSetup = nil
             plate.wasInCombat = nil
@@ -937,7 +928,6 @@ local function invalidatePlateLayout()
         plate.layoutSetup = nil
         plate.suppressed  = nil
         plate.wasInCombat = nil
-        plate.colorCache  = nil
     end
 end
 
